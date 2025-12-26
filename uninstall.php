@@ -5,9 +5,14 @@ if (!defined('WP_UNINSTALL_PLUGIN')) {
 
 delete_option('sst_settings');
 
-global $wpdb;
-$wpdb->query(
-    "DELETE FROM {$wpdb->options}
-     WHERE option_name LIKE '_transient_sst_rate_%'
-        OR option_name LIKE '_transient_timeout_sst_rate_%'"
-);
+// Clean up cached transients without direct DB queries.
+$zips = get_option('sst_cached_zips', []);
+if (is_array($zips)) {
+    foreach ($zips as $zip) {
+        $zip = preg_replace('/\D+/', '', (string)$zip);
+        if (strlen($zip) === 5) {
+            delete_transient('sst_rate_' . $zip);
+        }
+    }
+}
+delete_option('sst_cached_zips');

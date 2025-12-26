@@ -3,7 +3,7 @@
  * Plugin Name: Simple Sales Taxes
  * Plugin URI: https://github.com/perodriguezl/simple-sales-taxes
  * Description: Dynamically sets WooCommerce tax rate based on customer ZIP code using a RapidAPI sales tax endpoint.
- * Version: 0.2.0
+ * Version: 0.2.2
  * Author: Pedro Rodriguez
  * Author URI: https://rapidapi.com/perodriguezl/api/u-s-a-sales-taxes-per-zip-code
  * License: GPLv2 or later
@@ -11,7 +11,7 @@
  * Text Domain: simple-sales-taxes
  * Domain Path: /languages
  * Requires at least: 6.0
- * Tested up to: 6.6
+ * Tested up to: 6.9
  * Requires PHP: 7.4
  * Requires Plugins: woocommerce
  */
@@ -23,20 +23,19 @@ add_action('plugins_loaded', function () {
         return;
     }
 
-    class Simple_Sales_Taxes_RapidAPI {
-        const VERSION    = '0.2.0';
+    class Simple_Sales_Taxes {
+        const VERSION    = '0.2.2';
         const OPTION_KEY = 'sst_settings';
         const SECTION_ID = 'simple_sales_taxes';
+        const CACHED_ZIPS_OPTION = 'sst_cached_zips';
 
         public function __construct() {
-            add_action('init', [$this, 'load_textdomain']);
-
             // Settings UI under WooCommerce > Settings > Tax
             add_filter('woocommerce_get_sections_tax', [$this, 'add_tax_section']);
             add_filter('woocommerce_get_settings_tax', [$this, 'add_tax_settings'], 10, 2);
             add_action('woocommerce_update_options_tax_' . self::SECTION_ID, [$this, 'save_settings']);
 
-            // Custom field renderer for the settings page (Test Connection + External Services)
+            // Custom field renderers
             add_action('woocommerce_admin_field_sst_test_connection', [$this, 'render_test_connection_field']);
             add_action('woocommerce_admin_field_sst_external_services', [$this, 'render_external_services_field']);
 
@@ -49,16 +48,8 @@ add_action('plugins_loaded', function () {
             // Override matched tax rates at runtime
             add_filter('woocommerce_matched_tax_rates', [$this, 'override_matched_tax_rates'], 20, 6);
 
-            // Helpful admin warning if enabled but no key
+            // Admin notice if enabled but missing key
             add_action('admin_notices', [$this, 'admin_notice_missing_key']);
-        }
-
-        public function load_textdomain(): void {
-            load_plugin_textdomain(
-                'simple-sales-taxes',
-                false,
-                dirname(plugin_basename(__FILE__)) . '/languages'
-            );
         }
 
         private function get_settings(): array {
@@ -167,21 +158,18 @@ add_action('plugins_loaded', function () {
                     'default' => $s['debug_log'],
                 ],
 
-                // New: informational disclosure
                 [
-                    'type' => 'sst_external_services',
-                    'id'   => 'sst_external_services',
-                    'title'=> esc_html__('External Services', 'simple-sales-taxes'),
+                    'type'  => 'sst_external_services',
+                    'id'    => 'sst_external_services',
+                    'title' => esc_html__('External Services', 'simple-sales-taxes'),
                 ],
 
-                // New: Test Connection tool
                 [
-                    'type' => 'sst_test_connection',
-                    'id'   => 'sst_test_connection',
-                    'title'=> esc_html__('Test Connection', 'simple-sales-taxes'),
+                    'type'  => 'sst_test_connection',
+                    'id'    => 'sst_test_connection',
+                    'title' => esc_html__('Test Connection', 'simple-sales-taxes'),
                 ],
 
-                // Optional URLs (helps with marketplace compliance and user clarity)
                 [
                     'title'   => esc_html__('API Listing URL', 'simple-sales-taxes'),
                     'id'      => self::OPTION_KEY . '[api_listing_url]',
@@ -206,24 +194,36 @@ add_action('plugins_loaded', function () {
             ];
         }
 
-        public function save_settings() {
-            $posted = (isset($_POST[self::OPTION_KEY]) && is_array($_POST[self::OPTION_KEY]))
-                ? wp_unslash($_POST[self::OPTION_KEY])
-                : [];
+        public function save_settings(): void {
+            if (!current_user_can('manage_woocommerce')) {
+                return;
+            }
+
+            // WooCommerce settings pages include a nonce with action "woocommerce-settings".
+            $nonce = isset($_REQUEST['_wpnonce']) ? sanitize_text_field(wp_unslash($_REQUEST['_wpnonce'])) : '';
+            if ($nonce === '' || !wp_verify_nonce($nonce, 'woocommerce-settings')) {
+                return;
+            }
+
+            // Avoid touching raw $_POST arrays directly (Plugin Check).
+            $raw = filter_input(INPUT_POST, self::OPTION_KEY, FILTER_DEFAULT, FILTER_REQUIRE_ARRAY);
+            if (!is_array($raw)) {
+                $raw = [];
+            }
 
             $current = $this->get_settings();
             $new = $current;
 
-            $new['enabled']            = isset($posted['enabled']) ? 'yes' : 'no';
-            $new['rapidapi_key']       = isset($posted['rapidapi_key']) ? sanitize_text_field($posted['rapidapi_key']) : '';
-            $new['rapidapi_host']      = isset($posted['rapidapi_host']) ? sanitize_text_field($posted['rapidapi_host']) : $current['rapidapi_host'];
-            $new['endpoint_path']      = isset($posted['endpoint_path']) ? sanitize_text_field($posted['endpoint_path']) : $current['endpoint_path'];
-            $new['tax_label']          = isset($posted['tax_label']) ? sanitize_text_field($posted['tax_label']) : $current['tax_label'];
-            $new['tax_shipping']       = (isset($posted['tax_shipping']) && $posted['tax_shipping'] === 'no') ? 'no' : 'yes';
-            $new['cache_ttl_minutes']  = isset($posted['cache_ttl_minutes']) ? (string) max(1, intval($posted['cache_ttl_minutes'])) : $current['cache_ttl_minutes'];
-            $new['debug_log']          = (isset($posted['debug_log']) && $posted['debug_log'] === 'yes') ? 'yes' : 'no';
-            $new['api_listing_url']    = isset($posted['api_listing_url']) ? esc_url_raw($posted['api_listing_url']) : $current['api_listing_url'];
-            $new['privacy_policy_url'] = isset($posted['privacy_policy_url']) ? esc_url_raw($posted['privacy_policy_url']) : $current['privacy_policy_url'];
+            $new['enabled']            = isset($raw['enabled']) ? 'yes' : 'no';
+            $new['rapidapi_key']       = isset($raw['rapidapi_key']) ? sanitize_text_field(wp_unslash($raw['rapidapi_key'])) : '';
+            $new['rapidapi_host']      = isset($raw['rapidapi_host']) ? sanitize_text_field(wp_unslash($raw['rapidapi_host'])) : $current['rapidapi_host'];
+            $new['endpoint_path']      = isset($raw['endpoint_path']) ? sanitize_text_field(wp_unslash($raw['endpoint_path'])) : $current['endpoint_path'];
+            $new['tax_label']          = isset($raw['tax_label']) ? sanitize_text_field(wp_unslash($raw['tax_label'])) : $current['tax_label'];
+            $new['tax_shipping']       = (isset($raw['tax_shipping']) && wp_unslash($raw['tax_shipping']) === 'no') ? 'no' : 'yes';
+            $new['cache_ttl_minutes']  = isset($raw['cache_ttl_minutes']) ? (string) max(1, intval(wp_unslash($raw['cache_ttl_minutes']))) : $current['cache_ttl_minutes'];
+            $new['debug_log']          = (isset($raw['debug_log']) && wp_unslash($raw['debug_log']) === 'yes') ? 'yes' : 'no';
+            $new['api_listing_url']    = isset($raw['api_listing_url']) ? esc_url_raw(wp_unslash($raw['api_listing_url'])) : $current['api_listing_url'];
+            $new['privacy_policy_url'] = isset($raw['privacy_policy_url']) ? esc_url_raw(wp_unslash($raw['privacy_policy_url'])) : $current['privacy_policy_url'];
 
             $this->update_settings($new);
 
@@ -278,6 +278,16 @@ add_action('plugins_loaded', function () {
             return substr($digits, 0, 5);
         }
 
+        private function remember_cached_zip(string $zip): void {
+            $zips = get_option(self::CACHED_ZIPS_OPTION, []);
+            if (!is_array($zips)) $zips = [];
+
+            if (!in_array($zip, $zips, true)) {
+                $zips[] = $zip;
+                update_option(self::CACHED_ZIPS_OPTION, $zips, false);
+            }
+        }
+
         private function get_tax_rate_percent_for_zip(string $zip, array $settings): ?float {
             $ttl_minutes = max(1, intval($settings['cache_ttl_minutes'] ?? 720));
             $cache_key = 'sst_rate_' . $zip;
@@ -291,6 +301,8 @@ add_action('plugins_loaded', function () {
             if ($rate === null) return null;
 
             set_transient($cache_key, (string)$rate, $ttl_minutes * MINUTE_IN_SECONDS);
+            $this->remember_cached_zip($zip);
+
             return $rate;
         }
 
@@ -326,7 +338,6 @@ add_action('plugins_loaded', function () {
             $code = (int) wp_remote_retrieve_response_code($resp);
             $body = (string) wp_remote_retrieve_body($resp);
 
-            // Common auth/subscription errors
             if ($code === 401 || $code === 403) {
                 $this->log($settings, "RapidAPI auth/subscription error HTTP {$code}.");
                 return null;
@@ -342,9 +353,6 @@ add_action('plugins_loaded', function () {
                 $this->log($settings, 'Unexpected payload (not JSON). Body: ' . substr($body, 0, 400));
                 return null;
             }
-
-            // Expected API sample:
-            // {"state":"FL","state_rate":0.06,"estimated_combined_rate":0.07,"estimated_county_rate":0.01,"estimated_city_rate":0,"estimated_special_rate":0,"risk_level":0}
 
             $raw = null;
 
@@ -428,6 +436,7 @@ add_action('plugins_loaded', function () {
 
         public function render_test_connection_field($value): void {
             $nonce = wp_create_nonce('sst_test_connection');
+
             echo '<tr valign="top">';
             echo '<th scope="row" class="titledesc">';
             echo '<label>' . esc_html__('Test Connection', 'simple-sales-taxes') . '</label>';
@@ -439,7 +448,7 @@ add_action('plugins_loaded', function () {
                 'simple-sales-taxes'
             ) . '</p>';
 
-            echo '<input type="text" id="sst-test-zip" value="78641" style="width:120px;" />';
+            echo '<input type="text" id="sst-test-zip" value="' . esc_attr('78641') . '" style="width:120px;" />';
             echo '&nbsp;';
             echo '<button type="button" class="button" id="sst-test-btn" data-nonce="' . esc_attr($nonce) . '">'
                 . esc_html__('Test Connection', 'simple-sales-taxes') . '</button>';
@@ -452,13 +461,16 @@ add_action('plugins_loaded', function () {
         }
 
         public function enqueue_admin_assets(string $hook): void {
-            // Only load on Woo settings pages
             if ($hook !== 'woocommerce_page_wc-settings') {
                 return;
             }
 
-            $tab = isset($_GET['tab']) ? sanitize_text_field(wp_unslash($_GET['tab'])) : '';
-            $section = isset($_GET['section']) ? sanitize_text_field(wp_unslash($_GET['section'])) : '';
+            // Use filter_input to avoid Plugin Check "recommended" nonce noise on $_GET.
+            $tab = filter_input(INPUT_GET, 'tab', FILTER_UNSAFE_RAW);
+            $section = filter_input(INPUT_GET, 'section', FILTER_UNSAFE_RAW);
+
+            $tab = is_string($tab) ? sanitize_text_field(wp_unslash($tab)) : '';
+            $section = is_string($section) ? sanitize_text_field(wp_unslash($section)) : '';
 
             if ($tab !== 'tax' || $section !== self::SECTION_ID) {
                 return;
@@ -501,7 +513,6 @@ add_action('plugins_loaded', function () {
                 wp_send_json_error(['message' => __('Missing RapidAPI key. Save your key first.', 'simple-sales-taxes')], 400);
             }
 
-            // Perform a live fetch (do not use cache for this test)
             $rate = $this->fetch_rate_from_rapidapi($zip, $s);
 
             if ($rate === null) {
@@ -511,10 +522,11 @@ add_action('plugins_loaded', function () {
             }
 
             wp_send_json_success([
-                'zip'         => $zip,
-                'rate_percent'=> $rate,
-                'example_tax' => round(10.00 * ($rate / 100.0), 2),
-                'message'     => sprintf(
+                'zip'          => $zip,
+                'rate_percent' => $rate,
+                'example_tax'  => round(10.00 * ($rate / 100.0), 2),
+                'message'      => sprintf(
+                    /* translators: 1: ZIP code 2: percent rate */
                     __('Success. ZIP %1$s -> %2$s%%', 'simple-sales-taxes'),
                     $zip,
                     $rate
@@ -523,5 +535,5 @@ add_action('plugins_loaded', function () {
         }
     }
 
-    new Simple_Sales_Taxes_RapidAPI();
+    new Simple_Sales_Taxes();
 });
